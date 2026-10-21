@@ -67,11 +67,14 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.cp.base import is_zigzag
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
+    cp_interleave_input_ids,
     cp_materialize_global_token_order,
+    cp_shard_hidden_states,
     is_cp_active,
 )
 from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
@@ -121,6 +124,11 @@ from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.managers.mm_owner_embedding import (
+    MmOwnerSession,
+    has_owner_span_work,
+    select_owner_group,
+)
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     embed_mm_inputs,
@@ -4123,6 +4131,11 @@ class DeepseekV4Model(nn.Module):
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
         )
+        local_input_ids = (
+            cp_shard_hidden_states(forward_batch.input_ids, forward_batch)
+            if cp_extend
+            else input_ids
+        )
         if self.engram_hasher is not None:
             if cp_extend:
                 # n-gram hashing needs each token's predecessors: hash the whole prompt
@@ -4192,11 +4205,21 @@ class DeepseekV4Model(nn.Module):
                 else:
                     saved_full = attn_backend.enter_late_layer_tail(forward_batch)
                 state = state.take_rows(tail.rows)
-                input_ids = tail.rows(input_ids)
-                if not (
-                    get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
-                ):
-                    input_ids_global = tail.rows(input_ids_global)
+                local_input_ids = tail.rows(local_input_ids)
+                if tail.cp_metadata is not None:
+                    # CP tail rows are rank-local; rebuild the interleaved IDs the
+                    # layers expect from the full-prompt rows they came from.
+                    tail_input_ids = forward_batch.input_ids[tail.output_token_indices]
+                    input_ids = cp_interleave_input_ids(tail_input_ids, forward_batch)
+                    input_ids_global = input_ids
+                else:
+                    input_ids = tail.rows(input_ids)
+                    if not (
+                        get_parallel().attn_dp_size > 1
+                        and get_moe_a2a_backend().is_none()
+                    ):
+                        input_ids_global = tail.rows(input_ids_global)
+                    local_input_ids = input_ids
                 positions = tail.positions
                 if hash_ids is not None:
                     hash_ids = tail.rows(hash_ids)
@@ -4226,7 +4249,7 @@ class DeepseekV4Model(nn.Module):
                     and forward_batch.contains_mm_inputs()
                 ):
                     hidden_states = torch.where(
-                        (input_ids == self.config.image_token_id)[:, None, None],
+                        (local_input_ids == self.config.image_token_id)[:, None, None],
                         before_engram,
                         hidden_states,
                     )
@@ -4605,17 +4628,21 @@ class DeepseekV4ForCausalLM(nn.Module):
             and config.vision_n_layers > 0
             and not getattr(config, "language_model_only", False)
         ):
-            if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+            if get_parallel().pp_group.world_size != 1 or not (
+                get_moe_a2a_backend().is_none()
+                or (_is_cuda and get_moe_a2a_backend().is_megamoe())
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP without PP; "
                     "MoE A2A requires CUDA MegaMoE"
+                )
+            if get_parallel().attn_cp_size != 1 and (
+                _is_npu or is_zigzag() or not get_moe_a2a_backend().is_none()
+            ):
+                raise ValueError(
+                    "V4.1 vision context parallelism requires the CUDA interleave "
+                    "strategy without MoE A2A; NPU, zigzag CP and MegaMoE are not "
+                    "supported yet"
                 )
 
             args = SimpleNamespace(**vars(config), dim=config.hidden_size)
@@ -4624,6 +4651,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.image_start = nn.Parameter(torch.empty(config.hidden_size))
             self.image_end = nn.Parameter(torch.empty(config.hidden_size))
             self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
+        self.mm_owner_group = (
+            select_owner_group(get_parallel())
+            if self.vision is not None and _is_cuda
+            else None
+        )
         self.model = DeepseekV4Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -4758,7 +4790,42 @@ class DeepseekV4ForCausalLM(nn.Module):
             spans.append(span)
         return spans
 
-    def _prepare_mm_embeddings(self, input_ids, forward_batch):
+    def _image_span_signature(self, item, span_len: int):
+        h, w = int(item.n_vit_h), int(item.n_vit_w)
+        r = self.config.vision_downsample_ratio
+        lh, lw = (h + r - 1) // r, (w + r - 1) // r
+        expected = 2 + lh * (lw + 1)
+        if expected != span_len:
+            raise ValueError(
+                f"image grid {(h, w)} yields {expected} span tokens, "
+                f"placeholder has {span_len}"
+            )
+        plan = item.model_specific_data.get(GPU_PLAN_KEY)
+        feature = item.feature
+        return (
+            h,
+            w,
+            tuple(feature.shape) if isinstance(feature, torch.Tensor) else None,
+            None if plan is None else tuple(sorted(plan.items())),
+        )
+
+    def _mm_owner_session(self, forward_batch) -> Optional[MmOwnerSession]:
+        if self.mm_owner_group is None or not has_owner_span_work(
+            forward_batch.mm_inputs,
+            forward_batch.extend_prefix_lens_cpu,
+            forward_batch.extend_seq_lens_cpu,
+        ):
+            return None
+        return MmOwnerSession(
+            group=self.mm_owner_group,
+            device=self.image_start.device,
+            dtype=self.image_start.dtype,
+            width=self.config.hidden_size,
+            rids=list(forward_batch.rids or ()),
+            signature=self._image_span_signature,
+        )
+
+    def _prepare_mm_embeddings(self, input_ids, forward_batch, mm_owner):
         # Keep scheduler hash IDs intact: the shared embedder clamps its input in place.
         input_embeds, _ = embed_mm_inputs(
             mm_inputs_list=[
@@ -4770,12 +4837,46 @@ class DeepseekV4ForCausalLM(nn.Module):
             input_ids=input_ids.clone(),
             input_embedding=self.get_input_embeddings(),
             multimodal_model=self,
+            mm_owner=mm_owner,
         )
         forward_batch.mm_input_embeds = input_embeds
         return input_embeds
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.get_input_embeddings()
+
+    def prepare_model_inputs(
+        self,
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self.vision is None:
+            return input_ids, input_embeds
+        has_images = (
+            not forward_batch.forward_mode.is_decode()
+            and not forward_batch.forward_mode.is_target_verify()
+            and forward_batch.mm_inputs is not None
+            and any(x is not None for x in forward_batch.mm_inputs)
+        )
+        if has_images and input_embeds is not None:
+            raise ValueError("Cannot combine input_embeds and image inputs")
+        mm_owner = self._mm_owner_session(forward_batch) if has_images else None
+        with mm_owner.fence() if mm_owner is not None else nullcontext():
+            if has_images:
+                input_embeds = self._prepare_mm_embeddings(
+                    input_ids, forward_batch, mm_owner
+                )
+            if not (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            ):
+                # Decode/verify IDs are already vocabulary IDs; remap prompt image
+                # hashes for Engram and routing.
+                input_ids = input_ids.masked_fill(
+                    input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
+                )
+        return input_ids, input_embeds
 
     def set_dspark_layers_to_capture(self, layer_ids: List[int]) -> None:
         if not self.pp_group.is_last_rank:
@@ -4833,27 +4934,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         Scheduler hash IDs stay intact for multimodal cache keys; the language
         model uses image_token_id for Engram masking and visual MoE routing.
         """
-        if (
-            getattr(self, "vision", None) is not None
-            and not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.mm_inputs is not None
-            and any(x is not None for x in forward_batch.mm_inputs)
-        ):
-            if input_embeds is not None:
-                raise ValueError("Cannot combine input_embeds and image inputs")
-            input_embeds = self._prepare_mm_embeddings(input_ids, forward_batch)
-        if getattr(self, "vision", None) is not None and not (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-        ):
-            # Decode/verify IDs are already vocabulary IDs; remap prompt image
-            # hashes for Engram and routing.
-            input_ids = input_ids.masked_fill(
-                input_ids >= MM_PAD_SHIFT_VALUE, self.config.image_token_id
-            )
-
-        return input_ids, input_embeds
+        return self.prepare_model_inputs(input_ids, forward_batch, input_embeds)
 
     def forward(
         self,
@@ -4911,10 +4992,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
+            token_indices = tail.output_token_indices
             output.hidden_states_token_indices = (
-                tail.token_indices[: tail.real_rows_count]
+                token_indices[: tail.real_rows_count]
                 if tail.real_rows_count is not None
-                else tail.token_indices
+                else token_indices
             )
         return output
 

@@ -26,6 +26,109 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _dsv41_dspark_pd_parallelism_supported(cfg) -> bool:
+    if cfg.dp_size != 1 or cfg.dcp_size != 1:
+        return False
+    if cfg.disaggregation_mode == "decode":
+        return (
+            not cfg.enable_dp_attention
+            and cfg.attn_cp_size == 1
+            and not cfg.enable_prefill_context_parallel
+        )
+
+    prefill_cp = cfg.enable_prefill_cp and cfg.attn_cp_size > 1
+    return (
+        (not cfg.enable_dp_attention or prefill_cp)
+        and (cfg.attn_cp_size == 1 or prefill_cp)
+        and (not cfg.enable_prefill_context_parallel or prefill_cp)
+    )
+
+
+def validate_deepseek_v4_mega_moe_token_budget(
+    server_args: ServerArgs,
+) -> None:
+    """Ensure the DSV4 prefill budget fits MegaMoE's per-rank buffer."""
+    cfg = resolving_view(server_args)
+    mega_moe_enabled = cfg.moe_a2a_backend == "megamoe"
+    if not mega_moe_enabled or cfg.disaggregation_mode == "decode":
+        # decode node will skip the check because decode bs is not relevant with --chunk-prefill-size
+        return
+
+    if cfg.pp_size > 1 and cfg.enable_dynamic_chunking:
+        return
+
+    if cfg.chunked_prefill_size is None or cfg.chunked_prefill_size <= 0:
+        raise ValueError(
+            "DeepSeekV4 with MegaMoE requires chunked prefill to be enabled. "
+            "Set --chunked-prefill-size to a positive value; "
+            "--chunked-prefill-size=-1 is unsafe because MegaMoE's per-rank "
+            "token requirement would not have a strict prefill-forward bound."
+        )
+
+    if cfg.enable_prefill_cp:
+        token_partition_size = cfg.attn_cp_size
+        token_partition_name = "attn_cp_size"
+        token_alignment = 1
+        local_chunked_prefill_size = (
+            cfg.chunked_prefill_size + token_partition_size - 1
+        ) // token_partition_size
+    elif cfg.enable_dp_attention:
+        token_partition_size = cfg.dp_size
+        token_partition_name = "dp_size"
+        token_alignment = max(
+            cfg.tp_size // cfg.dp_size // cfg.attn_cp_size,
+            1,
+        )
+        local_chunked_prefill_size = cfg.chunked_prefill_size // token_partition_size
+    else:
+        # Pure TP and PP with static chunking are handled here.
+        token_partition_size = 1
+        token_partition_name = "none"
+        # global_num_tokens will ceil_align to attn_tp_size so the validation needs to do alignment as well
+        token_alignment = max(
+            cfg.tp_size // token_partition_size // cfg.attn_cp_size,
+            1,
+        )
+        local_chunked_prefill_size = cfg.chunked_prefill_size
+
+    if local_chunked_prefill_size <= 0:
+        raise ValueError(
+            "DeepSeekV4 with MegaMoE requires a positive effective per-rank "
+            "chunked prefill size. "
+            f"Current values: chunked_prefill_size="
+            f"{cfg.chunked_prefill_size}, "
+            f"token_partition={token_partition_name}, "
+            f"token_partition_size={token_partition_size}."
+        )
+
+    required_tokens_per_rank = (
+        (local_chunked_prefill_size + token_alignment - 1)
+        // token_alignment
+        * token_alignment
+    )
+    max_tokens_per_rank = (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+    )
+    if max_tokens_per_rank < required_tokens_per_rank:
+        raise ValueError(
+            "DeepSeekV4 with MegaMoE requires "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to "
+            "cover each rank's effective prefill token budget. "
+            f"Current values: chunked_prefill_size="
+            f"{cfg.chunked_prefill_size}, "
+            f"token_partition={token_partition_name}, "
+            f"token_partition_size={token_partition_size}, "
+            f"token_alignment={token_alignment}, "
+            f"required_per_rank={required_tokens_per_rank}, "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
+            f"{max_tokens_per_rank}. Set "
+            "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK to at "
+            f"least {required_tokens_per_rank}, or lower "
+            "--chunked-prefill-size until the effective per-rank budget fits. "
+            "Otherwise MegaMoE falls back to the fused MoE path at runtime."
+        )
+
+
 def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None:
     """Apply DeepSeek V4 environment defaults, request limits, and validation."""
     cfg = resolving_view(server_args)
@@ -207,12 +310,15 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
     )
 
     cfg = resolving_view(server_args)
-    if model_config_of(server_args).hf_config.model_type != "deepseek_v41":
+    hf_config = model_config_of(server_args).hf_config
+    if hf_config.model_type != "deepseek_v41":
         if cfg.enable_encoder_swa_bounded_replay:
             raise ValueError(
                 "--enable-encoder-swa-bounded-replay requires DeepSeek-V4.1"
             )
         return
+    if hf_config.vision_n_layers > 0 and cfg.enable_prefill_cp:
+        _validate_deepseek_v41_vision_prefill_cp(server_args)
     if (
         cfg.dsv4_attn_backend == "trtllm"
         and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED
@@ -234,7 +340,8 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
             ),
             ("DP attention", attn_dp_enabled_of(cfg)),
-            ("context parallelism", cfg.attn_cp_size > 1),
+            # Prefill CP declares attn_cp_size and DP attention only later.
+            ("context parallelism", cfg.attn_cp_size > 1 or cfg.enable_prefill_cp),
             ("external cache linker", cfg.enable_unified_cache_external_linker),
             ("unified memory", cfg.enable_unified_memory),
             ("PD disaggregation", cfg.disaggregation_mode != "null"),
@@ -370,3 +477,37 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                     "--enable-decoder-swa-bounded-replay cannot be combined with "
                     f"{feature} yet; disable one of them."
                 )
+
+
+def _validate_deepseek_v41_vision_prefill_cp(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.cp_strategy != "interleave":
+        raise ValueError(
+            "DeepSeek-V4.1 vision with prefill CP requires --cp-strategy "
+            f"interleave; got {cfg.cp_strategy!r}."
+        )
+    if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
+        locked = getattr(server_args, "_cuda_graph_config_locked", set())
+        if (Phase.PREFILL, "backend") in locked:
+            raise ValueError(
+                "DeepSeek-V4.1 vision with prefill CP runs eager prefill; remove "
+                "the explicit prefill CUDA graph backend."
+            )
+        declare_resolution(
+            server_args,
+            "validate_deepseek_v41_features",
+            cuda_graph_config=with_phase(
+                cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+            ),
+        )
+        logger.warning(
+            "Disabling the prefill CUDA graph for DeepSeek-V4.1 vision with prefill CP."
+        )
+    if (
+        str(cfg.speculative_algorithm).upper() == "DSPARK"
+        and cfg.enable_decoder_swa_bounded_replay
+    ):
+        raise ValueError(
+            "DeepSeek-V4.1 vision with prefill CP does not support DSpark together "
+            "with --enable-decoder-swa-bounded-replay yet."
+        )
