@@ -24,6 +24,7 @@ from .scoring import (
     select_decode,
     write_prefill,
 )
+from .sm90_decode import try_sm90_decode
 from .types import (
     CapturedPrefillInputs,
     DecodeInputs,
@@ -127,6 +128,13 @@ class FullTopKIndexer:
         )
 
     def _torch_decode(self, inputs: DecodeInputs) -> None:
+        handled, _ = try_sm90_decode(
+            inputs=inputs,
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+        )
+        if handled:
+            return
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
