@@ -25,7 +25,7 @@ from sglang.kernels.ops.attention.dsv4.decode_attention_sm100 import (
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     cast_q_fp8_for_q8kv8_prefill,
     dequantize_k_cache_paged,
-    dequantize_k_cache_paged_v41,
+    dequantize_k_cache_paged as dequantize_k_cache_paged_dsv4,
     fp8_dtype,
     gather_dequant_requant_fp8_paged,
     q8kv8_padded_num_heads,
@@ -1175,6 +1175,9 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
+        # Upstream gates CP sparse prefill on its MegaAttention path; this branch
+        # has no such path, so the gate is always open.
+        self.mega_attn: bool = False
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
@@ -3983,7 +3986,7 @@ class DeepseekV4AttnBackend(
                 or layer_id == source_key[0]
                 or gather.dequantized_source != source_key
             ):
-                dequantize_k_cache_paged_v41(
+                dequantize_k_cache_paged_dsv4(
                     extra_k_cache,
                     flat_token_ids,
                     page_size=extra_page_size,
@@ -3992,7 +3995,7 @@ class DeepseekV4AttnBackend(
                 )
                 if source_key is not None:
                     gather.dequantized_source = source_key
-        dequantize_k_cache_paged_v41(
+        dequantize_k_cache_paged_dsv4(
             token_to_kv_pool.get_swa_key_buffer_radix(layer_id),
             cache.swa_token_ids,
             page_size=cache.swa_page_size,

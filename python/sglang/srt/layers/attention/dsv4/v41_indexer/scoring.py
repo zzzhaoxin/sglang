@@ -11,6 +11,7 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
+    INDEX_HEAD_DIM,
     finish_paged_indexer_topk,
     fp4_index_logits_candidates,
     fp4_index_logits_decode,
@@ -344,6 +345,8 @@ def _score_chunks(
     # The torch prefill indexer flag asks for the torch oracle, not this kernel.
     fused = (
         q.is_cuda
+        and q.dtype == torch.bfloat16
+        and q.shape[-1] == INDEX_HEAD_DIM
         and envs.SGLANG_OPT_USE_FUSED_DSV41_INDEXER_SCORES.get()
         and not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
     )
@@ -352,6 +355,7 @@ def _score_chunks(
     # the budget its [rows, lc] copies downstream stay under the torch peak.
     row_bytes = lc * 16 if fused else q.shape[1] * lc * 2
     rows_per_chunk = max(1, _TORCH_SCORE_BUDGET_BYTES // row_bytes)
+    candidate_fallback = False
     if candidate_blocks is not None:
         from sglang.kernels.ops.attention.dsv4.candidate_bf16_mqa import (
             can_use_candidate_bf16_mqa,
@@ -360,6 +364,9 @@ def _score_chunks(
 
         if not can_use_candidate_bf16_mqa(q, index_k, weights, block_size):
             candidate_blocks = None
+            # A rejected compact scorer falls back to the reference torch
+            # scores, not to the fused all-column kernel.
+            candidate_fallback = True
     if candidate_blocks is not None:
         # No [rows, heads, lc] or per-query K tensor on this path. Bound the
         # FP32 output and the logical-index/top-k temporaries instead.
@@ -373,7 +380,7 @@ def _score_chunks(
             s = candidate_bf16_mqa_logits(
                 q[tok_c], index_k, weights[tok_c], blocks, lens_c
             )
-        elif fused:
+        elif fused and not candidate_fallback:
             s = fused_index_scores(q[tok_c], index_k, weights[tok_c], lens_c)
         else:
             s = indexer.scores(q[tok_c], index_k, weights[tok_c])

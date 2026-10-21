@@ -507,7 +507,11 @@ def _validate_deepseek_v41_vision_prefill_cp(server_args: ServerArgs) -> None:
         str(cfg.speculative_algorithm).upper() == "DSPARK"
         and cfg.enable_decoder_swa_bounded_replay
     ):
-        raise ValueError(
-            "DeepSeek-V4.1 vision with prefill CP does not support DSpark together "
-            "with --enable-decoder-swa-bounded-replay yet."
+        # #40161 adds the CP tail hand-off (local tail rows, global output rows,
+        # tail-scoped logits) that this combination needs, so the #40219 guard
+        # no longer applies on this branch. Keep it visible for debugging.
+        logger.warning(
+            "DeepSeek-V4.1 vision with prefill CP runs DSpark together with "
+            "--enable-decoder-swa-bounded-replay; this combination is only "
+            "validated by the ported CP tail hand-off."
         )
