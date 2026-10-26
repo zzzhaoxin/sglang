@@ -8,7 +8,7 @@ Benchmark online serving with dynamic requests.
 
 Usage:
 python3 -m sglang.benchmark.serving --backend sglang --num-prompt 10
-
+--num-prompts xxx --random-input xxx --random-output xx
 python3 -m sglang.benchmark.serving --backend sglang --dataset-name random --num-prompts 3000 --random-input 1024 --random-output 1024 --random-range-ratio 0.5
 """
 
