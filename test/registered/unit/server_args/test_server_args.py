@@ -4439,19 +4439,27 @@ class TestDeepseekV41VisionPrefillCPArgs(CustomTestCase):
                 dict(prefill_backend=Backend.BREAKABLE, lock_prefill_backend=True),
                 "runs eager prefill",
             ),
-            (
-                dict(
-                    speculative_algorithm="DSPARK",
-                    enable_decoder_swa_bounded_replay=True,
-                ),
-                "DSpark.*decoder-swa-bounded-replay",
-            ),
         ):
             args = self._args(
                 max_running_requests=4, chunked_prefill_size=128, **overrides
             )
             with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
                 handle_model_specific_adjustments(args)
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_dspark_bounded_replay_uses_ported_cp_tail_handoff(self):
+        args = self._args(
+            speculative_algorithm="DSPARK",
+            enable_decoder_swa_bounded_replay=True,
+            max_running_requests=4,
+            chunked_prefill_size=128,
+        )
+        with self.assertLogs(
+            "sglang.srt.arg_groups.deepseek_v4_hook", level="WARNING"
+        ) as logs:
+            handle_model_specific_adjustments(args)
+        self.assertIn("ported CP tail hand-off", "\n".join(logs.output))
+        self.assertTrue(resolution_result(args, "enable_decoder_swa_bounded_replay"))
 
     def test_text_zigzag_and_default_prefill_graph_are_accepted(self):
         validate_deepseek_v41_features(

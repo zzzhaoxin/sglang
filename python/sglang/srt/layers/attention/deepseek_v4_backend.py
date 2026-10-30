@@ -1924,6 +1924,12 @@ class DeepseekV4AttnBackend(
             )
         if tail.cp_metadata is not None:
             forward_batch.attn_cp_metadata = tail.cp_metadata
+            # This is the logical full sequence bound, not a padded CP shard
+            # length. The CP metadata separately describes physical collectives
+            # and each rank's logical MoE prefix.
+            forward_batch.global_num_token_non_padded_cpu = (
+                tail.cp_metadata.total_seq_lens
+            )
             set_local_dp_buffer_len(sum(tail.cp_metadata.per_rank_actual_token))
         return saved
 

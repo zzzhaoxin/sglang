@@ -69,10 +69,15 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
 from sglang.srt.layers.cp.base import is_zigzag
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
-from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
+from sglang.srt.layers.cp.interleave import (
+    attn_cp_interleave_gather,
+    cp_fit_slot_rows,
+    cp_interleave_local_input_ids,
+    cp_sequence_to_interleave_order,
+    cp_take_slot_rows,
+)
 from sglang.srt.layers.cp.utils import (
     cp_gather_full_sequence_states,
-    cp_interleave_input_ids,
     cp_materialize_global_token_order,
     cp_shard_hidden_states,
     is_cp_active,
@@ -85,6 +90,7 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     dp_gather_partial,
     dp_gather_replicate,
+    dp_gather_slot,
     dp_reduce_scatter_tensor,
     dp_reduce_scatterv_async,
     dp_scatter,
@@ -110,6 +116,7 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
     should_skip_post_experts_all_reduce,
+    sum_post_experts_output,
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
@@ -993,6 +1000,10 @@ class MqaAttentionBase(nn.Module):
             prefix=add_prefix("wo_b", prefix),
             parallel_group="attn_tp",
         )
+        # Humming must shard the canonical (pre-transform) tensors, not its
+        # kernel-private packed layout. wo_a uses the plain absorbed BMM path.
+        self.wq_b._cp_decode_attn_tp_shard = True
+        self.wo_b._cp_decode_attn_tp_shard = True
 
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
@@ -2111,11 +2122,15 @@ class MQALayer(MqaAttentionBase):
                     torch.cuda.current_stream(),
                 )
                 tail = attn_backend.forward_metadata.late_layer_tail
+                # `kv` carries the CP-materialized global row count and
+                # `get_swa_out_cache_loc` returns exactly that many destination
+                # slots, so the positions have to be trimmed to it. The tail's
+                # `pos_global` spans the whole tail range and can be longer
+                # (measured: kv=128, swa_loc=128, pos_global=131), which the
+                # fused store rejects on its symbolic batch_size.
                 global_positions = (
-                    tail.pos_global
-                    if tail is not None
-                    else forward_batch.positions[: kv.shape[0]]
-                )
+                    tail.pos_global if tail is not None else forward_batch.positions
+                )[: kv.shape[0]]
                 get_token_to_kv_pool().set_swa_key_buffer_radix_fused_norm_rope(
                     layer_id=self.layer_id,
                     swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
@@ -2690,6 +2705,21 @@ class MQALayer(MqaAttentionBase):
             forward_batch=state.forward_batch,
             x_quant=state.pop("attn_x_quant"),
         )
+
+
+def _cp_moe_slot_rows(forward_batch: ForwardBatch) -> int:
+    """Rows one attention-DP rank contributes to the gathered MoE buffer.
+
+    This is the width the DP gather/scatter move for this rank's slot
+    (``global_num_tokens``), which the union of the CP shards must fill. It
+    equals ``attn_cp_size * local_rows`` only when the DP padding agrees with
+    the CP physical shard size, so callers fit the rank-major buffer to it
+    instead of assuming the two agree.
+    """
+    counts = forward_batch.global_num_tokens_cpu
+    if counts is not None and len(counts) > 1:
+        return int(counts[dp_gather_slot()])
+    return sum(forward_batch.attn_cp_metadata.per_rank_actual_token)
 
 
 @contextmanager
@@ -3503,7 +3533,29 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _use_cp:
             moe_a2a_backend = get_moe_a2a_backend()
             if moe_a2a_backend.is_none():
-                hidden_states = attn_cp_interleave_gather(hidden_states)
+                # One DP slot holds this rank's complete CP rank-major buffer
+                # (its own CP shard per block, padding included), because the
+                # hash-routing IDs and the MoE output rows are read back through
+                # the same slots. The DP slot width comes from the batch, so fit
+                # every CP block to it rather than letting memcpy truncate the
+                # buffer at its head (which would drop whole CP blocks).
+                cp_local_rows = hidden_states.shape[0]
+                cp_hidden_states = attn_cp_interleave_gather(hidden_states)
+                if get_parallel().attn_dp_size > 1:
+                    cp_slot_rows = _cp_moe_slot_rows(forward_batch)
+                    cp_hidden_states = cp_fit_slot_rows(
+                        cp_hidden_states, forward_batch, cp_slot_rows
+                    )
+                    hidden_states = get_global_dp_buffer(get_parallel().tp_group)
+                    dp_gather_replicate(
+                        hidden_states, cp_hidden_states, forward_batch
+                    )
+                else:
+                    # DP off: no DP gather installs the gathered CP buffer, so
+                    # the MoE must consume the CP gather directly. Dropping it
+                    # leaves the MoE on this rank's CP shard while the
+                    # hash-routing IDs are global (row-count mismatch).
+                    hidden_states = cp_hidden_states
             else:
                 assert (
                     moe_a2a_backend.is_deepep()
@@ -3567,12 +3619,30 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
 
         if _use_cp and get_moe_a2a_backend().is_none():
-            if self.config.model_type == "deepseek_v41":
+            if (
+                self.config.model_type == "deepseek_v41"
+                or get_parallel().attn_dp_size > 1
+            ):
                 parallel = get_parallel()
-                hidden_states = parallel.tp_group.all_reduce(hidden_states)
-                hidden_states = hidden_states.tensor_split(parallel.attn_cp_size)[
-                    parallel.attn_cp_rank
-                ].contiguous()
+                # `mlp_reduce_scatter` told the MoE to leave its post-experts
+                # sum owed; complete exactly that sum, once. It collapses into
+                # one _TP all-reduce only while EP and MoE-TP merge
+                # (moe_dp_size == 1), so never name the group by hand.
+                hidden_states = sum_post_experts_output(hidden_states)
+                if parallel.attn_dp_size > 1:
+                    cp_hidden_states = hidden_states.new_empty(
+                        (cp_slot_rows, *hidden_states.shape[1:])
+                    )
+                    dp_scatter(cp_hidden_states, hidden_states, forward_batch)
+                else:
+                    # DP off: no DP scatter runs, so the reduced MoE output is
+                    # already this rank's CP slot. Falling through to the
+                    # pre-MoE `cp_hidden_states` here would return the experts'
+                    # *input* and silently discard their output.
+                    cp_hidden_states = hidden_states
+                hidden_states = cp_take_slot_rows(
+                    cp_hidden_states, forward_batch, cp_local_rows
+                )
             else:
                 hidden_states = attn_cp_interleave_reduce_scatter(hidden_states)
         elif _use_tp_moe_gather:
@@ -4180,6 +4250,11 @@ class DeepseekV4Model(nn.Module):
                     if tail is not None
                     else hidden_states.shape[0]
                 ),
+                cp_metadata=(
+                    tail.cp_metadata
+                    if tail is not None
+                    else (forward_batch.attn_cp_metadata if cp_extend else None)
+                ),
             )
         tail_in_graph = (
             tail is not None
@@ -4210,7 +4285,17 @@ class DeepseekV4Model(nn.Module):
                     # CP tail rows are rank-local; rebuild the interleaved IDs the
                     # layers expect from the full-prompt rows they came from.
                     tail_input_ids = forward_batch.input_ids[tail.output_token_indices]
-                    input_ids = cp_interleave_input_ids(tail_input_ids, forward_batch)
+                    # Tail ownership follows original prompt indices, not indices
+                    # rebased at the tail start (which may begin on CP rank 1).
+                    # Use the same explicit map as the hidden-state CP gather.
+                    if get_moe_a2a_backend().is_none():
+                        input_ids = cp_sequence_to_interleave_order(
+                            tail_input_ids,
+                            forward_batch,
+                            sum(tail.cp_metadata.per_rank_actual_token),
+                        )
+                    else:
+                        input_ids = local_input_ids
                     input_ids_global = input_ids
                 else:
                     input_ids = tail.rows(input_ids)
@@ -4444,11 +4529,25 @@ class DeepseekV4Model(nn.Module):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
+            if is_cp_active(forward_batch):
+                # Hash routing reads one ID per MoE row, so build the IDs with
+                # the hidden-state gather's own interleave map and fit them to
+                # the same DP slot: `input_ids` here is this rank's CP shard,
+                # not the full prompt.
+                local_input_ids = cp_interleave_local_input_ids(
+                    forward_batch,
+                    hidden_states.shape[0],
+                    _cp_moe_slot_rows(forward_batch),
+                )
+            else:
+                local_input_ids = input_ids
             # Token ids are replicated within an attention-TP group. Use replicate
             # gather here to avoid summing duplicated ids when attention_tp_size > 1.
             # Clone because the MAX_LEN gather may zero its local input in place.
             dp_gather_replicate(
-                input_ids_global, input_ids[:, None].clone(), forward_batch
+                input_ids_global,
+                local_input_ids[:, None].clone(),
+                forward_batch,
             )
             input_ids_global = input_ids_global.squeeze(-1)
         else:

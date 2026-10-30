@@ -277,8 +277,12 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         attn_cp_size=cfg.tp_size // attn_dp_size,
     )
     if not is_npu():
-        assert attn_dp_size == 1, (
-            "For round-robin split mode, dp attention is not supported."
+        assert attn_dp_size == 1 or (
+            get_platform().is_cuda
+            and cfg.cp_strategy == "interleave"
+            and cfg.moe_a2a_backend in ("none", "megamoe")
+        ), (
+            "DP attention with CP requires CUDA interleave and none/megamoe MoE."
         )
         assert cfg.tp_size <= 8, (
             "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
@@ -444,6 +448,19 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
         )
 
     if cfg.enable_decoder_swa_bounded_replay:
+        # This validator precedes validate_deepseek_v4_cp, which normalizes
+        # --attn-cp-size to TP/DP. Validate that effective geometry, not the
+        # user's pre-normalization CP argument.
+        bounded_dp_size = (
+            context_parallel_attn_dp_size(cfg, "DeepSeek-V4 context parallelism")
+            if cfg.enable_prefill_cp
+            else cfg.attn_dp_size
+        )
+        bounded_cp_size = (
+            cfg.tp_size // bounded_dp_size
+            if cfg.enable_prefill_cp
+            else cfg.attn_cp_size
+        )
         # Late layers see a per-request tail slice, not the captured prefill shape.
         # The breakable backend is admitted: the tail switch runs as eager breaks and
         # the tail is a fixed-capacity row block inside the captured segments.
@@ -454,13 +471,20 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
                 not in (Backend.DISABLED, Backend.BREAKABLE),
             ),
             # Late-layer communication uses one row count per attention-DP rank.
-            # Attention TP/CP shards need a separate tail padding layout.
+            # Interleave CP supplies an equal-padded, rank-major tail layout.
             (
-                "DP attention other than attention TP 1 with supported MoE backends",
+                "DP attention other than attention TP 1 with supported MoE/CP layouts",
                 attn_dp_enabled_of(cfg)
                 and not (
-                    cfg.attn_dp_size == cfg.tp_size
-                    and cfg.attn_cp_size == 1
+                    bounded_dp_size * bounded_cp_size == cfg.tp_size
+                    and (
+                        bounded_cp_size == 1
+                        or (
+                            get_platform().is_cuda
+                            and cfg.enable_prefill_cp
+                            and cfg.cp_strategy == "interleave"
+                        )
+                    )
                     and (
                         (get_platform().is_hip and cfg.moe_a2a_backend == "none")
                         or (

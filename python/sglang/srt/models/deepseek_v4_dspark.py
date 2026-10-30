@@ -19,6 +19,7 @@ from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import is_shared_experts_fusion_disabled
@@ -943,6 +944,14 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         pp_proxy_tensors=None,
     ) -> LogitsProcessorOutput:
         del get_embedding, pp_proxy_tensors
+        # Context is injected from the gathered target hidden states; the draft
+        # block must never inherit the target prefill's token-sharded CP layout.
+        # A static CP group is fine: maybe_use_decode_attn_tp slices attention
+        # heads while every CP partner retains the same DP-local draft rows.
+        if is_cp_active(forward_batch):
+            raise ValueError(
+                "DSpark draft blocks do not support active context parallelism."
+            )
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)
         x = input_embeds
